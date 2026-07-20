@@ -7,6 +7,8 @@ dependencies = [
     "mcp>=1.28",
     "psycopg[binary]>=3.2",   # Postgres driver (v3) for the audit log
     "pyyaml>=6",              # policy config is YAML (policy-as-code)
+    "uvicorn>=0.30",          # serves the HTTP gateway (MCP endpoint + approvals API)
+    "httpx>=0.27",            # used by demo/tests to drive the approvals API
 ]
 
 [project.optional-dependencies]

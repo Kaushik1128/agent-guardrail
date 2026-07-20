@@ -36,11 +36,57 @@ def get_policy_path() -> Path:
 
 
 def get_agent_id() -> str:
-    """The caller's identity. ASSERTED on stdio (set by whoever launches the
-    gateway), not authenticated - real auth arrives with the HTTP transport."""
+    """The caller's identity on the STDIO transport only, where it is ASSERTED
+    (set by whoever launches the gateway). The HTTP transport authenticates
+    instead - see get_agent_keys()."""
     return os.environ.get("GUARDRAIL_AGENT_ID", "demo-agent")
 
 
 def get_agent_role() -> str | None:
-    """The caller's role, used to look up its policy. Asserted, like the id."""
+    """The caller's role on the stdio transport. Asserted, like the id."""
     return os.environ.get("GUARDRAIL_AGENT_ROLE")
+
+
+# --- HTTP transport: authentication + HITL tuning ---------------------------
+
+def get_agent_keys() -> dict[str, tuple[str, str]]:
+    """API-key map for the HTTP transport: key -> (agent_id, role).
+
+    Format: GUARDRAIL_AGENT_KEYS="key1:agent1:role1,key2:agent2:role2"
+    Keys live in the environment (or a secret store in production) - never in
+    git, and never in policy.yaml, which IS in git.
+    """
+    raw = os.environ.get("GUARDRAIL_AGENT_KEYS", "")
+    keys: dict[str, tuple[str, str]] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"GUARDRAIL_AGENT_KEYS entry must be key:agent_id:role, got {entry!r}"
+            )
+        key, agent_id, role = (p.strip() for p in parts)
+        keys[key] = (agent_id, role)
+    return keys
+
+
+def get_admin_key() -> str | None:
+    """Key required by the approve/deny endpoints. If unset, those endpoints
+    reject everything - fail closed, never open."""
+    return os.environ.get("GUARDRAIL_ADMIN_KEY") or None
+
+
+def get_approval_timeout() -> float:
+    """How long a call waits in the approval queue before being denied (seconds).
+
+    Must be shorter than the agent's HTTP read timeout, since the tools/call
+    request stays open while waiting.
+    """
+    return float(os.environ.get("GUARDRAIL_APPROVAL_TIMEOUT", "120"))
+
+
+def get_approval_poll_interval() -> float:
+    """How often the parked call re-checks the approvals table (seconds)."""
+    return float(os.environ.get("GUARDRAIL_APPROVAL_POLL_INTERVAL", "0.5"))

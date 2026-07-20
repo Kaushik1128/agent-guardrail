@@ -85,7 +85,10 @@ class SqliteAuditLog:
         agent_id: str | None,
         role: str | None,
         tool_name: str,
-        decision: PolicyDecision,
+        decision: str,          # 'allow' | 'deny' | 'pending'
+        rule: str,
+        reason: str,
+        spend_amount: float | None = None,
     ) -> None:
         ts, epoch = _now()
         self._conn.execute(
@@ -94,10 +97,33 @@ class SqliteAuditLog:
                 tool_name, decision, decision_rule, decision_reason, spend_amount)
                VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?, ?, ?)""",
             (ts, epoch, correlation_id, agent_id, role, tool_name,
-             "allow" if decision.allowed else "deny",
-             decision.rule.value, decision.reason, decision.spend_amount),
+             decision, rule, reason, spend_amount),
         )
         self._conn.commit()
+
+    def log_policy_decision(
+        self,
+        correlation_id: str,
+        *,
+        agent_id: str | None,
+        role: str | None,
+        tool_name: str,
+        decision: PolicyDecision,
+    ) -> None:
+        """Convenience: record a PolicyDecision from the engine."""
+        self.log_decision(
+            correlation_id,
+            agent_id=agent_id,
+            role=role,
+            tool_name=tool_name,
+            decision=(
+                "pending" if decision.needs_approval
+                else "allow" if decision.allowed else "deny"
+            ),
+            rule=decision.rule.value,
+            reason=decision.reason,
+            spend_amount=decision.spend_amount,
+        )
 
     def log_outcome(
         self,
@@ -139,6 +165,40 @@ class SqliteAuditLog:
             (agent_id, tool, cutoff),
         )
         return float(cur.fetchone()[0])
+
+    def recent_calls(self, limit: int = 50) -> list[dict[str, Any]]:
+        """One row per call (latest decision wins), newest first - the SQLite
+        equivalent of the Postgres v_tool_calls view, pivoted in Python."""
+        cur = self._conn.execute(
+            """SELECT * FROM audit_events WHERE correlation_id IN (
+                   SELECT correlation_id FROM audit_events
+                   GROUP BY correlation_id ORDER BY max(id) DESC LIMIT ?
+               ) ORDER BY id""",
+            (limit,),
+        )
+        cols = [c[0] for c in cur.description]
+        calls: dict[str, dict[str, Any]] = {}
+        for row in (dict(zip(cols, r)) for r in cur.fetchall()):
+            call = calls.setdefault(row["correlation_id"], {
+                "correlation_id": row["correlation_id"],
+                "started_at": row["ts"], "last_event_at": row["ts"],
+                "agent_id": None, "role": None, "tool_name": None,
+                "arguments": None, "decision": None, "decision_rule": None,
+                "decision_reason": None, "outcome": None, "error": None,
+            })
+            call["last_event_at"] = row["ts"]
+            for k in ("agent_id", "role", "tool_name"):
+                call[k] = call[k] or row[k]
+            if row["event_type"] == "request":
+                call["arguments"] = json.loads(row["arguments_json"] or "{}")
+            elif row["event_type"] == "decision":  # later events overwrite: final verdict wins
+                call["decision"] = row["decision"]
+                call["decision_rule"] = row["decision_rule"]
+                call["decision_reason"] = row["decision_reason"]
+            else:
+                call["outcome"] = row["outcome"]
+                call["error"] = row["error"]
+        return sorted(calls.values(), key=lambda c: c["last_event_at"], reverse=True)
 
     # --- helpers ------------------------------------------------------------
     def all_rows(self) -> list[dict[str, Any]]:

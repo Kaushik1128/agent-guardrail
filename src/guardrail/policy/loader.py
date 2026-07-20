@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from guardrail.policy.models import (
+    Condition,
     Constraint,
     Policy,
     RateLimit,
@@ -60,7 +61,13 @@ def _parse_role(name: str, body: dict[str, Any]) -> Role:
         constraints = tuple(
             _parse_constraint(name, tool, c) for c in (entry.get("constraints") or [])
         )
-        allowed[tool] = ToolRule(tool=tool, constraints=constraints)
+        approval_always, approval_if = _parse_approval(name, tool, entry.get("approval"))
+        allowed[tool] = ToolRule(
+            tool=tool,
+            constraints=constraints,
+            approval_always=approval_always,
+            approval_if=approval_if,
+        )
 
     rate_limit = None
     if rl := body.get("rate_limit"):
@@ -91,6 +98,51 @@ def _parse_role(name: str, body: dict[str, Any]) -> Role:
         allowed_tools=allowed,
         rate_limit=rate_limit,
         spend_caps=tuple(spend_caps),
+    )
+
+
+def _parse_approval(
+    role: str, tool: str, spec: Any
+) -> tuple[bool, tuple[Condition, ...]]:
+    """Parse the optional `approval:` block of an allow entry.
+
+    Accepted shapes:
+        approval: always
+        approval:
+          require_if:
+            - field: amount
+              gt: 20
+    """
+    if spec is None:
+        return False, ()
+    if spec == "always":
+        return True, ()
+    if isinstance(spec, dict) and "require_if" in spec:
+        conditions = []
+        for c in spec["require_if"] or []:
+            field = c.get("field")
+            if not field:
+                raise PolicyError(
+                    f"Role '{role}', tool '{tool}': approval condition missing 'field'."
+                )
+            conditions.append(
+                Condition(
+                    field=field,
+                    gt=None if c.get("gt") is None else float(c["gt"]),
+                    gte=None if c.get("gte") is None else float(c["gte"]),
+                    lt=None if c.get("lt") is None else float(c["lt"]),
+                    lte=None if c.get("lte") is None else float(c["lte"]),
+                    equals=None if c.get("equals") is None else str(c["equals"]),
+                    matches=c.get("matches"),
+                )
+            )
+        if not conditions:
+            raise PolicyError(
+                f"Role '{role}', tool '{tool}': approval.require_if is empty."
+            )
+        return False, tuple(conditions)
+    raise PolicyError(
+        f"Role '{role}', tool '{tool}': approval must be 'always' or a require_if block."
     )
 
 

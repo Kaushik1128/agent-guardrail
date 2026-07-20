@@ -15,11 +15,14 @@ from enum import Enum
 class DecisionRule(str, Enum):
     """Which check produced a decision (also stored in the audit log)."""
 
-    OK = "ok"                  # allowed - nothing objected
-    AUTHZ = "authz"            # role not permitted to call this tool
-    PARAMS = "params"          # an argument violated a constraint
-    RATE_LIMIT = "rate_limit"  # too many calls in the window
-    SPEND_CAP = "spend_cap"    # would exceed the spend cap
+    OK = "ok"                    # allowed - nothing objected
+    AUTHZ = "authz"              # role not permitted to call this tool
+    PARAMS = "params"            # an argument violated a constraint
+    RATE_LIMIT = "rate_limit"    # too many calls in the window
+    SPEND_CAP = "spend_cap"      # would exceed the spend cap
+    APPROVAL = "approval"        # passed all checks but needs a human decision
+    HITL = "hitl"                # a human decided (allow or deny)
+    HITL_TIMEOUT = "hitl_timeout"  # no human decided in time -> denied
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,10 @@ class PolicyDecision:
     # If this call represents spend (e.g. a refund amount), the engine records it
     # here so the audit log can sum it for future spend-cap checks.
     spend_amount: float | None = None
+    # True when the call passed every hard check but policy requires a human to
+    # sign off before it runs. `allowed` is False in that case - the call is not
+    # allowed YET; the HITL flow may upgrade it after a human approves.
+    needs_approval: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,11 +53,31 @@ class Constraint:
 
 
 @dataclass(frozen=True)
+class Condition:
+    """A trigger on one argument. Distinct from Constraint on purpose:
+    a Constraint failing means DENY; a Condition matching means a consequence
+    fires (here: human approval required). Mixing the two shapes invites
+    inverted-logic bugs."""
+
+    field: str
+    gt: float | None = None
+    gte: float | None = None
+    lt: float | None = None
+    lte: float | None = None
+    equals: str | None = None       # compared as strings
+    matches: str | None = None      # regex, re.search
+
+
+@dataclass(frozen=True)
 class ToolRule:
     """Permission to call one tool, plus any constraints on its arguments."""
 
     tool: str
     constraints: tuple[Constraint, ...] = ()
+    # Human-in-the-loop: 'always' queues every call of this tool for approval;
+    # conditions queue only the calls that match (e.g. amount > 20).
+    approval_always: bool = False
+    approval_if: tuple[Condition, ...] = ()
 
 
 @dataclass(frozen=True)

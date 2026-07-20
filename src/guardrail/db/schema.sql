@@ -32,8 +32,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
     -- request events
     arguments        JSONB,
 
-    -- decision events
-    decision         TEXT CHECK (decision IN ('allow', 'deny')),
+    -- decision events. 'pending' records that a call entered the approval
+    -- queue; a later decision event (rule 'hitl' / 'hitl_timeout') records how
+    -- it left. A call needing approval therefore has TWO decision events.
+    decision         TEXT CHECK (decision IN ('allow', 'deny', 'pending')),
     decision_rule    TEXT,        -- which check fired: authz | params | rate_limit | spend_cap | ok
     decision_reason  TEXT,        -- human-readable explanation
     spend_amount     NUMERIC,     -- the spend this call represents, if any (for spend caps)
@@ -66,10 +68,41 @@ CREATE TRIGGER trg_audit_events_append_only
     BEFORE UPDATE OR DELETE ON audit_events
     FOR EACH ROW EXECUTE FUNCTION audit_events_reject_mutation();
 
+-- Widen the decision CHECK on databases created before the HITL phase.
+-- (Dropping + re-adding the named constraint is idempotent.)
+ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_decision_check;
+ALTER TABLE audit_events ADD CONSTRAINT audit_events_decision_check
+    CHECK (decision IN ('allow', 'deny', 'pending'));
+
+-- ---------------------------------------------------------------------------
+-- approvals: the HITL queue. Deliberately the project's ONE mutable table -
+-- an approval is live STATE (a question awaiting an answer), not history.
+-- Every transition it goes through is still recorded immutably in
+-- audit_events, so mutating this table never erases the record.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS approvals (
+    correlation_id   UUID PRIMARY KEY,           -- same id as the audit events
+    requested_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    agent_id         TEXT NOT NULL,
+    role             TEXT,
+    tool_name        TEXT NOT NULL,
+    arguments        JSONB,
+    reason           TEXT,                       -- why policy queued it
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'approved', 'denied', 'timeout')),
+    decided_at       TIMESTAMPTZ,
+    decided_by       TEXT,                       -- reviewer name/id
+    decision_note    TEXT                        -- reviewer's comment
+);
+
+CREATE INDEX IF NOT EXISTS ix_approvals_status ON approvals (status, requested_at);
+
 -- ---------------------------------------------------------------------------
 -- v_tool_calls: one row per call, pivoted from the event stream, for the
 -- dashboard. A view (not a second table) keeps this always-consistent with the
 -- log and rebuildable for free - there is no projection to maintain.
+-- A call that went through approval has two decision events; we surface the
+-- LATEST one (the final verdict), ordering by id.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_tool_calls AS
 SELECT
@@ -80,9 +113,12 @@ SELECT
     max(role)                                                  AS role,
     max(tool_name)                                             AS tool_name,
     (array_agg(arguments)       FILTER (WHERE event_type = 'request'))[1]  AS arguments,
-    max(decision)               FILTER (WHERE event_type = 'decision')     AS decision,
-    max(decision_rule)          FILTER (WHERE event_type = 'decision')     AS decision_rule,
-    max(decision_reason)        FILTER (WHERE event_type = 'decision')     AS decision_reason,
+    (array_agg(decision        ORDER BY id DESC)
+                                FILTER (WHERE event_type = 'decision'))[1] AS decision,
+    (array_agg(decision_rule   ORDER BY id DESC)
+                                FILTER (WHERE event_type = 'decision'))[1] AS decision_rule,
+    (array_agg(decision_reason ORDER BY id DESC)
+                                FILTER (WHERE event_type = 'decision'))[1] AS decision_reason,
     max(outcome)                FILTER (WHERE event_type = 'outcome')      AS outcome,
     (array_agg(error)           FILTER (WHERE event_type = 'outcome'))[1]  AS error
 FROM audit_events

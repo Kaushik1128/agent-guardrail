@@ -13,9 +13,9 @@ the whole point, since anything that reads untrusted input (emails, web pages,
 retrieved documents) can be steered by it.
 
 > **Status:** built in phases.
-> **Phase 1** (gateway MVP + audit log) and **Phase 2** (policy engine + Postgres)
-> are complete. HITL approval, dashboard, sample agent, adversarial tests, and
-> deployment follow.
+> **Phase 1** (gateway MVP + audit log), **Phase 2** (policy engine + Postgres),
+> and **Phase 3** (HTTP transport, API-key auth, HITL approval queue) are
+> complete. Dashboard, sample agent, adversarial tests, and deployment follow.
 
 ## Architecture
 
@@ -49,6 +49,39 @@ Policy is evaluated *before* the request is logged, so a call is never counted
 against its own rate limit. Denied calls are still audited (request + decision),
 they just never reach the tool.
 
+### The HITL approval flow ("park and poll")
+
+Policy can mark calls as requiring human sign-off (`approval: always`, or
+conditions like `amount > 20`). The approval check runs **last**: only calls that
+already passed every hard check can queue - a human cannot approve something
+policy forbids outright.
+
+A queued call writes a `pending` row to the **approvals table** (deliberately the
+project's one *mutable* table: an approval is live state, not history - every
+transition is still recorded immutably in the audit log). The in-flight MCP call
+then stays open, polling the database until a reviewer decides via the REST API,
+or a timeout expires - **timeout means deny** (fail closed). Decisions are an
+atomic compare-and-set (`WHERE status='pending'`), so racing reviewers - or a
+reviewer racing the timeout - produce exactly one winner.
+
+Why poll the DB instead of an in-process `asyncio.Event`? The decision arrives
+through a different door (the REST API), possibly from a different process. State
+in the database means any process can answer, the queue survives restarts, and
+the dashboard reads it with a plain SELECT. The poll interval (~0.5s) is noise
+against human reaction time. The one constraint: the agent's HTTP read timeout
+must exceed the approval timeout, since the `tools/call` request stays open.
+
+### Authentication (HTTP transport)
+
+Agents authenticate to `/mcp` with an API key (`Authorization: Bearer <key>`);
+the gateway maps key → `(agent_id, role)` from the `GUARDRAIL_AGENT_KEYS` env
+var - so the key proves *who* is calling and `policy.yaml` (in git) decides what
+that role *may do*. Secrets live in the environment, never in git. Admin
+endpoints (`/api/...`) require a separate `X-Admin-Key`. Both fail closed: no
+keys configured means nobody gets in. The stdio transport still exists for local
+development, where identity is asserted via env vars - a documented trade-off,
+not an accident.
+
 ### The audit log is also the policy state
 
 The append-only log is the single source of truth, and it doubles as the policy
@@ -63,16 +96,11 @@ Maps onto the [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/) (202
 
 | Risk | How this project addresses it | Status |
 |------|-------------------------------|--------|
-| **MCP07** – Insufficient Authn/Authz | Role-based policy engine: per-role tool allowlists | Phase 2 ✅ |
+| **MCP07** – Insufficient Authn/Authz | API-key authentication per agent + role-based tool allowlists | Phase 3 ✅ |
 | **MCP08** – Lack of Audit & Telemetry | Append-only log of every request/decision/outcome, UPDATE/DELETE blocked by a DB trigger | Phase 2 ✅ |
 | **MCP02** – Privilege Escalation / Scope Creep | Scope is *declared* (allowlists, param constraints, spend caps), never accumulated | Phase 2 ✅ |
 | **MCP05** – Command Injection | Parameter validation, e.g. `query_database` must be a `SELECT` | Phase 2 ✅ |
-| **MCP06** – Intent Flow Subversion | Can't stop prompt injection, but caps its blast radius; risky calls will stall in HITL | Phase 3 |
-
-**Honest scope:** identity on the stdio transport is *asserted* by whoever
-launches the gateway (env vars), not *authenticated*. Real per-agent auth
-(API keys / OAuth) arrives with the HTTP transport in Phase 3. Saying otherwise
-would be the wrong lesson - this is literally MCP07.
+| **MCP06** – Intent Flow Subversion | Can't stop prompt injection, but caps its blast radius: unauthorized tools are denied, risky calls stall in the HITL queue | Phase 3 ✅ |
 
 ## Project layout
 
@@ -80,22 +108,29 @@ would be the wrong lesson - this is literally MCP07.
 policy.yaml                    # the authorization surface (policy-as-code)
 docker-compose.yml             # local Postgres
 src/guardrail/
-  config.py                    # env-driven config (DB, policy path, agent identity)
+  config.py                    # env-driven config (DB, policy, keys, HITL tuning)
   mock_tools/server.py         # downstream MCP server: send_email, query_database, issue_refund
-  gateway/server.py            # the proxy: MCP server to the agent + client to the tools
+  gateway/
+    core.py                    # transport-independent pipeline: policy -> audit -> HITL -> forward
+    server.py                  # stdio transport (local dev; asserted identity)
+    http_app.py                # HTTP transport: /mcp (agents) + /api (humans) + auth
+    http_server.py             # uvicorn entry point
   policy/                      # the policy engine
-    models.py                  #   typed policy (roles, constraints, limits, decisions)
+    models.py                  #   typed policy (roles, constraints, approval conditions)
     loader.py                  #   parse + validate policy.yaml (fails loud)
-    engine.py                  #   evaluate() -> ALLOW / DENY, fail-closed
+    engine.py                  #   evaluate() -> ALLOW / DENY / NEEDS-APPROVAL, fail-closed
     state.py                   #   rate/spend state interface + in-memory impl for tests
+  approvals.py                 # the HITL queue (the one mutable store; CAS decisions)
   audit/                       # append-only audit log (two interchangeable backends)
     sqlite.py                  #   zero-setup fallback (and for tests)
     postgres.py                #   the real store
   db/
-    schema.sql                 #   audit_events table + append-only trigger + v_tool_calls view
+    schema.sql                 #   audit_events + append-only trigger + approvals + v_tool_calls
     migrate.py                 #   apply the schema
-scripts/run_agent_demo.py      # end-to-end demo (allowed + denied calls)
-tests/                         # policy unit tests + gateway e2e + Postgres integration
+scripts/
+  run_agent_demo.py            # policy demo over stdio (allowed + denied calls)
+  run_hitl_demo.py             # HITL demo over HTTP (park -> approve / deny)
+tests/                         # policy unit + gateway e2e + HITL e2e + Postgres integration
 ```
 
 ## Getting started
@@ -118,6 +153,33 @@ python scripts/run_agent_demo.py
 Launches the gateway as the `support-agent` role and makes a mix of legitimate and
 policy-violating calls, so you can watch some get allowed and others denied, then
 prints the audit trail. Uses SQLite unless `DATABASE_URL` is set.
+
+### Run the HITL demo (no Docker needed)
+
+```bash
+python scripts/run_hitl_demo.py
+```
+
+Boots the HTTP gateway and plays both parts: an authenticated agent whose large
+refund parks in the approval queue, and a human reviewer who approves one call
+and denies another - printing the full timeline and the resulting audit view.
+
+### Run the HTTP gateway yourself
+
+```bash
+cp .env.example .env    # dev keys; generate real ones for anything shared
+python -m guardrail.gateway.http_server
+
+# agent door (MCP over streamable HTTP):
+#   POST http://127.0.0.1:8000/mcp/   with  Authorization: Bearer dev-key-support
+
+# human door:
+curl -H "X-Admin-Key: dev-admin-key" "http://127.0.0.1:8000/api/approvals?status=pending"
+curl -H "X-Admin-Key: dev-admin-key" -X POST \
+     -d '{"decision":"approve","reviewer":"kaushik","note":"ok"}' \
+     http://127.0.0.1:8000/api/approvals/<correlation_id>/decide
+curl -H "X-Admin-Key: dev-admin-key" "http://127.0.0.1:8000/api/calls?limit=20"
+```
 
 ### Run with Postgres
 
@@ -183,5 +245,12 @@ roles:
 - **Low-level `Server` for the gateway, `FastMCP` for the mock tools.** The gateway
   mirrors whatever downstream exposes (discovered at runtime); the mock tools are
   static, so decorators fit.
-- **stdio transport for now**, switching to Streamable HTTP in Phase 3 when the
-  HITL approval queue requires a long-running service.
+- **One pipeline, two transports.** All enforcement lives in
+  `gateway/core.py`; the stdio and HTTP transports are thin wrappers, so policy
+  behaviour cannot drift between them.
+- **The MCP endpoint runs stateless.** Every request is self-contained and all
+  state that matters (audit, rate windows, approvals) is in the database, so the
+  gateway can restart or scale horizontally without breaking agents.
+- **Approvals are the one mutable store.** State and history are different
+  things: the queue is updated in place (with compare-and-set transitions), while
+  every transition is also recorded in the append-only audit log.

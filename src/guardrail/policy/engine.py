@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 
 from guardrail.policy.models import (
+    Condition,
     Constraint,
     DecisionRule,
     Policy,
@@ -81,9 +82,64 @@ class PolicyEngine:
                     f"(already {already}, this call {spend_amount}).",
                 )
 
+        # 5. Human-in-the-loop check, LAST on purpose: only calls that already
+        #    passed every hard check may queue for approval. A call that
+        #    violates authz/params/limits is denied outright - a human cannot
+        #    approve something policy forbids.
+        approval_reason = _approval_needed(tool_rule, arguments)
+        if approval_reason:
+            return PolicyDecision(
+                False,
+                DecisionRule.APPROVAL,
+                approval_reason,
+                spend_amount=spend_amount,
+                needs_approval=True,
+            )
+
         return PolicyDecision(
             True, DecisionRule.OK, "Allowed by policy.", spend_amount=spend_amount
         )
+
+
+def _approval_needed(tool_rule, arguments: dict) -> str | None:
+    """Why this call needs human approval, or None if it does not."""
+    if tool_rule.approval_always:
+        return f"Tool '{tool_rule.tool}' always requires human approval."
+    for cond in tool_rule.approval_if:
+        if _condition_met(cond, arguments):
+            return (
+                f"'{cond.field}'={arguments.get(cond.field)!r} matched an "
+                "approval condition; a human must approve this call."
+            )
+    return None
+
+
+def _condition_met(c: Condition, arguments: dict) -> bool:
+    if c.field not in arguments:
+        return False
+    value = arguments[c.field]
+
+    if c.equals is not None and str(value) == c.equals:
+        return True
+    if c.matches is not None and re.search(c.matches, str(value)):
+        return True
+
+    if any(v is not None for v in (c.gt, c.gte, c.lt, c.lte)):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            # Non-numeric where a numeric trigger is defined: require approval
+            # rather than silently skipping - unparseable input is suspicious.
+            return True
+        if c.gt is not None and numeric > c.gt:
+            return True
+        if c.gte is not None and numeric >= c.gte:
+            return True
+        if c.lt is not None and numeric < c.lt:
+            return True
+        if c.lte is not None and numeric <= c.lte:
+            return True
+    return False
 
 
 def _spend_for_call(role: Role, tool_name: str, arguments: dict) -> float | None:

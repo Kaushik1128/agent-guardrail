@@ -40,6 +40,12 @@ roles:
           - field: amount
             min: 0
             max: 50
+        # Small refunds go straight through; larger ones (still under the hard
+        # 50 cap) park in the approval queue until a human signs off.
+        approval:
+          require_if:
+            - field: amount
+              gt: 20
 
     rate_limit:
       max_calls: 10

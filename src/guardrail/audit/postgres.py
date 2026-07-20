@@ -67,7 +67,10 @@ class PostgresAuditLog:
         agent_id: str | None,
         role: str | None,
         tool_name: str,
-        decision: PolicyDecision,
+        decision: str,          # 'allow' | 'deny' | 'pending'
+        rule: str,
+        reason: str,
+        spend_amount: float | None = None,
     ) -> None:
         self._insert(
             {
@@ -76,11 +79,35 @@ class PostgresAuditLog:
                 "agent_id": agent_id,
                 "role": role,
                 "tool_name": tool_name,
-                "decision": "allow" if decision.allowed else "deny",
-                "decision_rule": decision.rule.value,
-                "decision_reason": decision.reason,
-                "spend_amount": decision.spend_amount,
+                "decision": decision,
+                "decision_rule": rule,
+                "decision_reason": reason,
+                "spend_amount": spend_amount,
             }
+        )
+
+    def log_policy_decision(
+        self,
+        correlation_id: str,
+        *,
+        agent_id: str | None,
+        role: str | None,
+        tool_name: str,
+        decision: PolicyDecision,
+    ) -> None:
+        """Convenience: record a PolicyDecision from the engine."""
+        self.log_decision(
+            correlation_id,
+            agent_id=agent_id,
+            role=role,
+            tool_name=tool_name,
+            decision=(
+                "pending" if decision.needs_approval
+                else "allow" if decision.allowed else "deny"
+            ),
+            rule=decision.rule.value,
+            reason=decision.reason,
+            spend_amount=decision.spend_amount,
         )
 
     def log_outcome(
@@ -126,6 +153,21 @@ class PostgresAuditLog:
                     (agent_id, tool, within_seconds),
                 )
                 return float(cur.fetchone()[0])
+
+    def recent_calls(self, limit: int = 50) -> list[dict[str, Any]]:
+        """One row per call from the v_tool_calls view, newest first."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM v_tool_calls ORDER BY last_event_at DESC LIMIT %s",
+                    (limit,),
+                )
+                cols = [d[0] for d in cur.description]
+                return [
+                    {c: (str(v) if c == "correlation_id" else v)
+                     for c, v in zip(cols, row)}
+                    for row in cur.fetchall()
+                ]
 
     # --- helpers ------------------------------------------------------------
     def all_rows(self) -> list[dict[str, Any]]:

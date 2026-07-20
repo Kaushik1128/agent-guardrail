@@ -44,8 +44,8 @@ def test_records_all_three_events_and_view(audit):
     cid = audit.new_correlation_id()
     audit.log_request(cid, agent_id="a1", role="support-agent",
                       tool_name="issue_refund", arguments={"amount": 30})
-    audit.log_decision(cid, agent_id="a1", role="support-agent", tool_name="issue_refund",
-                       decision=PolicyDecision(True, DecisionRule.OK, "ok", spend_amount=30))
+    audit.log_policy_decision(cid, agent_id="a1", role="support-agent", tool_name="issue_refund",
+                              decision=PolicyDecision(True, DecisionRule.OK, "ok", spend_amount=30))
     audit.log_outcome(cid, tool_name="issue_refund", outcome="success", result="done")
 
     rows = audit.all_rows()
@@ -82,6 +82,6 @@ def test_state_queries(audit):
     assert audit.count_requests("other", within_seconds=60) == 0
 
     cid = audit.new_correlation_id()
-    audit.log_decision(cid, agent_id="a1", role="r", tool_name="issue_refund",
-                       decision=PolicyDecision(True, DecisionRule.OK, "ok", spend_amount=40))
+    audit.log_policy_decision(cid, agent_id="a1", role="r", tool_name="issue_refund",
+                              decision=PolicyDecision(True, DecisionRule.OK, "ok", spend_amount=40))
     assert audit.sum_allowed_spend("a1", "issue_refund", within_seconds=86400) == 40

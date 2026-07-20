@@ -110,10 +110,11 @@ def test_rate_limit_ignores_old_calls(engine, state):
 
 def test_spend_under_cap_allowed_and_records_amount(engine, state):
     state.record_spend("a1", "issue_refund", 150, at=state.now())  # cap is 200/day
+    # amount <= 20 so the HITL approval condition (amount > 20) does not fire.
     d = _eval(engine, state, "issue_refund",
-              {"customer": "c", "amount": 40, "reason": "r"})
+              {"customer": "c", "amount": 20, "reason": "r"})
     assert d.allowed
-    assert d.spend_amount == 40  # recorded so the audit log can sum it later
+    assert d.spend_amount == 20  # recorded so the audit log can sum it later
 
 
 def test_spend_over_cap_denied(engine, state):
