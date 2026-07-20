@@ -1,0 +1,68 @@
+# Guardrail policy (policy-as-code).
+#
+# This file is the whole authorization surface: which role may call which tool,
+# with what argument constraints, under what rate and spend limits. It is
+# version-controlled on purpose - a change to who-can-do-what shows up as a
+# reviewable diff.
+#
+# Model: an agent presents a ROLE. A call is allowed only if the role lists the
+# tool AND every constraint passes AND limits are not exceeded. Anything not
+# listed is denied (deny-by-default).
+
+version: 1
+default_role: readonly-agent   # used when a caller presents no / unknown role
+
+roles:
+  # ---------------------------------------------------------------------------
+  support-agent:
+    description: >
+      Customer-support agent. Reads the database, emails internal addresses,
+      and issues small refunds - with a daily spend cap.
+    allow:
+      - tool: query_database
+        constraints:
+          # Read-only: must be a SELECT, and must not contain mutating keywords.
+          - field: query
+            must_match: '^\s*SELECT\b'
+            forbid_match: '(?i)\b(insert|update|delete|drop|alter|truncate|grant)\b'
+
+      - tool: send_email
+        constraints:
+          # Only internal recipients - blocks exfiltration to arbitrary domains.
+          - field: to
+            must_match: '@example\.com$'
+          - field: body
+            max_length: 2000
+
+      - tool: issue_refund
+        constraints:
+          # No negative refunds, and nothing over 50 per call.
+          - field: amount
+            min: 0
+            max: 50
+
+    rate_limit:
+      max_calls: 10
+      per_seconds: 60
+
+    spend_caps:
+      - tool: issue_refund
+        field: amount
+        max_total: 200      # at most 200 of refunds ...
+        per_seconds: 86400  # ... per rolling 24h
+
+  # ---------------------------------------------------------------------------
+  readonly-agent:
+    description: >
+      Analytics agent. Read-only database access and nothing else - it cannot
+      send email or move money no matter what its prompt is talked into.
+    allow:
+      - tool: query_database
+        constraints:
+          - field: query
+            must_match: '^\s*SELECT\b'
+            forbid_match: '(?i)\b(insert|update|delete|drop|alter|truncate|grant)\b'
+
+    rate_limit:
+      max_calls: 30
+      per_seconds: 60

@@ -40,6 +40,19 @@ def query_database(query: str) -> str:
     )
 
 
+@mcp.tool()
+def issue_refund(customer: str, amount: float, reason: str = "") -> str:
+    """Pretend to issue a refund. Returns a fake confirmation - no money moves.
+
+    Exists so the policy engine has something with a spend cap to guard.
+    """
+    txn_id = uuid.uuid4().hex[:12]
+    return (
+        f"[MOCK] Refund of {amount:.2f} issued to {customer} "
+        f"| reason={reason!r} | txn_id={txn_id}"
+    )
+
+
 if __name__ == "__main__":
     # stdio transport: this process reads JSON-RPC on stdin, writes on stdout.
     mcp.run(transport="stdio")

@@ -1,0 +1,33 @@
+# Local development stack.
+#
+# Phase 2 only needs Postgres (the audit log's new home). Later phases add the
+# gateway and dashboard as services; for now you run those from your shell so
+# they're easy to debug.
+#
+#   docker compose up -d db      # start Postgres in the background
+#   docker compose down          # stop it (data survives in the named volume)
+#   docker compose down -v       # stop it AND wipe the data volume
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: guardrail-db
+    environment:
+      POSTGRES_USER: guardrail
+      POSTGRES_PASSWORD: guardrail
+      POSTGRES_DB: guardrail
+    ports:
+      # host:container - the audit log connects to localhost:5432
+      - "5432:5432"
+    volumes:
+      - guardrail_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Lets `docker compose up --wait` block until Postgres actually accepts
+      # connections, so migrations don't race a half-started server.
+      test: ["CMD-SHELL", "pg_isready -U guardrail -d guardrail"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  guardrail_pgdata:

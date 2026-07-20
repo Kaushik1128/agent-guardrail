@@ -5,6 +5,8 @@ description = "A guardrail and audit layer that sits between an AI agent and its
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.28",
+    "psycopg[binary]>=3.2",   # Postgres driver (v3) for the audit log
+    "pyyaml>=6",              # policy config is YAML (policy-as-code)
 ]
 
 [project.optional-dependencies]
